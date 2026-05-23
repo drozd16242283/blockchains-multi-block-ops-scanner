@@ -1,15 +1,18 @@
 import {
-  Block,
-  FundsLockFailedEvent,
-  FundsLockedEvent,
-  IBlockchainNode,
-  INotifier,
-  RawLog,
-  SwapCancelledEvent,
-  SwapNotification,
-  SwapOutcome,
-  SwapRequestedEvent,
-  SwapSettledEvent,
+	Block,
+	FundsLockFailedEvent,
+	FundsLockedEvent,
+	IBlockchainNode,
+	INotifier,
+	LoanNotification,
+	LoanRequestedEvent,
+	LoanRepaidEvent,
+	RawLog,
+	SwapCancelledEvent,
+	SwapNotification,
+	SwapOutcome,
+	SwapRequestedEvent,
+	SwapSettledEvent,
 } from './types';
 import { IStateStore, InMemoryStateStore, PendingSwap } from './state-store';
 import { DEFAULT_RETRY, RetryConfig, withRetry } from './retry';
@@ -32,9 +35,11 @@ type ParsedSwapEvent =
   | FundsLockFailedEvent
   | SwapCancelledEvent;
 
+export type ParsedLoanEvent = LoanRequestedEvent | LoanRepaidEvent;
+
 type TerminalEvent = SwapSettledEvent | FundsLockFailedEvent | SwapCancelledEvent;
 
-function parseLog(log: RawLog, blockNumber: number): ParsedSwapEvent | null {
+function parseLog(log: RawLog, blockNumber: number): ParsedSwapEvent | ParsedLoanEvent | null {
   if (log.address !== VAULT_SWAP_CONTRACT) return null;
 
   const txHash = String(log.args['txHash'] ?? '');
@@ -87,6 +92,25 @@ function parseLog(log: RawLog, blockNumber: number): ParsedSwapEvent | null {
         blockNumber,
         txHash,
       };
+    case 'LoanRequested':
+      return {
+        type: 'LoanRequested',
+        loanId: String(log.args['loanId']),
+        borrower: String(log.args['borrower']),
+        amount: String(log.args['amount']),
+        dueBlock: Number(log.args['dueBlock']),
+        blockNumber,
+        txHash,
+      };
+    case 'LoanRepaid':
+      return {
+        type: 'LoanRepaid',
+        loanId: String(log.args['loanId']),
+        borrower: String(log.args['borrower']),
+        amountRepaid: String(log.args['amountRepaid']),
+        blockNumber,
+        txHash,
+      };
     default:
       return null;
   }
@@ -134,7 +158,7 @@ export interface VaultSwapScannerOptions {
  */
 export class VaultSwapScanner {
   private readonly node: IBlockchainNode;
-  private readonly notifier: INotifier;
+  private readonly notifier: INotifier<SwapNotification | LoanNotification>;
   private readonly state: IStateStore;
   private readonly confirmations: number;
   private readonly retry: RetryConfig;
@@ -143,7 +167,7 @@ export class VaultSwapScanner {
 
   constructor(
     node: IBlockchainNode,
-    notifier: INotifier,
+    notifier: INotifier<SwapNotification | LoanNotification>,
     optionsOrStartBlock: VaultSwapScannerOptions | number = {},
   ) {
     this.node = node;
@@ -207,8 +231,16 @@ export class VaultSwapScanner {
       try {
         for (const log of block.logs) {
           const ev = parseLog(log, n);
-          if (ev) await this.handleEvent(ev);
+          if (!ev) continue;
+					// Inline processing for simplicity
+          if (ev.type === 'LoanRequested' || ev.type === 'LoanRepaid') {
+            await this.handleLoanEvent(ev);
+          } else {
+            await this.handleEvent(ev);
+          }
         }
+        // Time-based: a loan defaults once a block strictly past its dueBlock is processed.
+        await this.detectLoanDefaults(n);
       } catch (err) {
         // State-store failure mid-finalize (or any unexpected throw inside event handling) lands here.
 				// We do NOT advance the cursor — next run re-processes this block.
@@ -332,6 +364,79 @@ export class VaultSwapScanner {
 			// The "consumer idempotent on swapId" contract closes this gap.
       console.error(
         `[scanner] markDelivered failed AFTER successful notify swapId=${ev.swapId} — possible duplicate when drainer next runs`,
+        err,
+      );
+    }
+  }
+
+  // ── Loan-side ─────────────────────────────────────────────────────────
+
+  private async handleLoanEvent(ev: ParsedLoanEvent): Promise<void> {
+    if (await this.state.hasLoanEmitted(ev.loanId)) return;
+
+    if (ev.type === 'LoanRequested') {
+      await this.state.setLoanRequested(ev.loanId, ev);
+      return;
+    }
+
+    // LoanRepaid
+    const pending = await this.state.getPendingLoan(ev.loanId);
+    if (!pending) {
+      console.warn(
+        `[scanner] orphan LoanRepaid ignored loanId=${ev.loanId} blockNumber=${ev.blockNumber}: no LoanRequested in our view`,
+      );
+      return;
+    }
+
+    // Repay arriving at or before dueBlock counts;
+		// later repays are dropped (detectLoanDefaults will have already emitted 'defaulted').
+    if (ev.blockNumber > pending.requested.dueBlock) {
+      console.warn(
+        `[scanner] late LoanRepaid ignored loanId=${ev.loanId} blockNumber=${ev.blockNumber} dueBlock=${pending.requested.dueBlock}`,
+      );
+      return;
+    }
+
+    const notification: LoanNotification = {
+      loanId: ev.loanId,
+      outcome: 'repaid',
+      requested: pending.requested,
+      repaid: ev,
+    };
+    await this.state.recordLoanTerminal(ev.loanId, notification);
+    await this.deliverLoan(notification);
+  }
+
+  private async detectLoanDefaults(blockNumber: number): Promise<void> {
+    const overdue = await this.state.getLoansDueBefore(blockNumber);
+    for (const loan of overdue) {
+      const notification: LoanNotification = {
+        loanId: loan.requested.loanId,
+        outcome: 'defaulted',
+        requested: loan.requested,
+      };
+      await this.state.recordLoanTerminal(loan.requested.loanId, notification);
+      await this.deliverLoan(notification);
+    }
+  }
+
+  private async deliverLoan(notification: LoanNotification): Promise<void> {
+    // Same single notifier instance handles both notification kinds.
+    try {
+      await withRetry(() => this.notifier.notify(notification), this.notifyRetry);
+    } catch (err) {
+      console.error(
+        `[scanner] inline delivery failed loanId=${notification.loanId} after retries; remains in outbox for background drainer`,
+        err,
+      );
+      return;
+    }
+
+    try {
+      await this.state.markLoanDelivered(notification.loanId);
+    } catch (err) {
+      console.error(
+        `[scanner] markLoanDelivered failed AFTER successful notify loanId=${notification.loanId} — possible duplicate when drainer next runs`,
         err,
       );
     }

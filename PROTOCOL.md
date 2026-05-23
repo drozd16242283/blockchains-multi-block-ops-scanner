@@ -96,3 +96,61 @@ Added scenarios:
    carries the prior `fundsLocked`.
 4. Mutual exclusivity: a `SwapSettled` arriving after a `SwapCancelled`
    has already terminated the swap is dropped.
+
+# Loan operation (Part 4)
+
+## Why no handler abstraction
+
+A clean version would extract `IOperationHandler` (`onLog` + `onBlockProcessed`) and dispatch swaps + loans from one operation-agnostic scanner. 
+With more time I would have done that - it scales to N operation types. 
+For two operations on a deadline the inline path is easier to read and doesn't lose anything. 
+A third operation type would be the moment to refactor.
+
+## Time-based default detection - why it's safe here, not for swaps
+
+Part 3 refuses to invent a `SwapTimedOut` outcome from nothing. 
+Loans are different: `dueBlock` is part of the `LoanRequested` event itself, so the chain declares the timeout.
+The scanner is observing chain truth, not fabricating it.
+Refunds and accounting can react to `defaulted` with the same confidence as any chain-emitted terminal.
+
+# Other design considerations
+
+## Node unreliability
+
+Every external call to the node (`getLatestBlockNumber`, `getBlock`) is wrapped in bounded exponential backoff (`retry.ts`, 4 attempts by default).
+On exhausted retries the scanner logs with context and halts cleanly - the cursor doesn't advance, so the next `start()` resumes at the same block. 
+We never silently skip a block we couldn't read -> that would mean dropping events.
+
+Notifier dispatch uses a separate, more generous retry budget (6 attempts) because downstream peers are typically further away network-wise and worth waiting longer for. 
+Whether the inline notify succeeds or not, the outbox holds the notification - the inline retry is an optimistic fast-path, not the durability guarantee.
+
+Production additions:
+
+- a circuit breaker around the RPC client so a hard-down node doesn't burn retry budget every poll cycle and hammer a struggling endpoint.
+- metrics on retry count + halt reason so alerting fires on a flapping node before it shows up as user-facing lag.
+- failover to a reserve node (or a pool, with health-based routing) for read paths.
+
+## Block time at 400ms
+
+The current scanner walks blocks sequentially in a single `start()` call. 
+At 10-second blocks this keeps up easily - one `getBlock` per ~10 seconds of wall clock. 
+At 400ms blocks (25x faster) several knobs flip:
+
+- **Polling -> subscriptions.** Polling at 100ms is wasteful and racy. If the node supports a new-block WebSocket subscription, the block iterator becomes event-driven instead of polled.
+- **Parallel block fetch.** Sequential `getBlock(n)` stops keeping up. Fetch a window of blocks in parallel with a concurrency cap, process them in order via a small reorder buffer.
+- **`confirmations` measured in time, not blocks.** "5 blocks behind head" is 50s at 10s blocks but 2s at 400ms blocks. Replace with `safeAgeMs`, or align with chain-specific finality semantics (Solana `commitment: 'finalized'`, EVM `12 blocks behind`).
+- **Outbox throughput.** Higher block rate means more terminal events per second. State-store writes batch, the drainer runs at higher concurrency.
+- **State store.** Pending state turns over faster relative to terminal cleanup. The DB choice (and indexing on `swapId` /`dueBlock`) matters more.
+
+Most of these are config knobs over the existing architecture - the scanner / state-store / correlator split survives. Parallel fetching is the one piece that would need a real change to the block-iteration loop.
+
+## Observability
+
+The scanner emits `console.warn` / `console.error` with a `[scanner]` prefix and structured context (`swapId`, `blockNumber`, error).
+For this assignment that's the observability surface. 
+Production replaces it with:
+
+- structured logging (JSON) with severity, `swapId`, `blockNumber`, and correlation IDs from upstream chain context,
+- metrics: `blocks_processed_total`, `notifications_emitted_total{outcome}`, `retry_count_total{call}`, `outbox_pending` gauge, `processing_lag_seconds` gauge,
+- alerts: cursor stalled (no advance in N minutes), outbox depth growing (drainer falling behind), retry-rate spike (node degraded),
+- traces spanning block-fetch -> event-parse -> finalize -> notify so end-to-end latency is attributable per swap.

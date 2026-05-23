@@ -1,7 +1,7 @@
 import { VaultSwapScanner } from '../src/scanner';
 import { SimulatedNode } from '../src/node';
 import { InMemoryStateStore } from '../src/state-store';
-import { Block, IBlockchainNode, INotifier, RawLog, SwapNotification } from '../src/types';
+import { Block, IBlockchainNode, INotifier, LoanNotification, RawLog, SwapNotification } from '../src/types';
 
 class CapturingNotifier implements INotifier {
   public notifications: SwapNotification[] = [];
@@ -85,6 +85,29 @@ const cancelled = (swapId: string, by = '0xAlice', reason = 'user_abort'): RawLo
   event: 'SwapCancelled',
   args: { txHash: `0xtx_${swapId}_cancel`, swapId, by, reason },
 });
+
+const loanRequested = (loanId: string, dueBlock: number, borrower = '0xBob', amount = '1000'): RawLog => ({
+  address: VAULT,
+  event: 'LoanRequested',
+  args: { txHash: `0xtx_${loanId}_req`, loanId, borrower, amount, dueBlock },
+});
+
+const loanRepaid = (loanId: string, borrower = '0xBob', amountRepaid = '1000'): RawLog => ({
+  address: VAULT,
+  event: 'LoanRepaid',
+  args: { txHash: `0xtx_${loanId}_rep`, loanId, borrower, amountRepaid },
+});
+
+// Captures both notification kinds — the same single notifier instance is
+// used for swaps and loans on the scanner.
+class CapturingDualNotifier implements INotifier<SwapNotification | LoanNotification> {
+  public swaps: SwapNotification[] = [];
+  public loans: LoanNotification[] = [];
+  async notify(n: SwapNotification | LoanNotification): Promise<void> {
+    if ('loanId' in n) this.loans.push(n);
+    else this.swaps.push(n);
+  }
+}
 
 const fastRetry = { maxAttempts: 4, baseDelayMs: 1, maxDelayMs: 5 };
 const fastNotifyRetry = { maxAttempts: 4, baseDelayMs: 1, maxDelayMs: 5 };
@@ -431,4 +454,116 @@ test('terminal events are mutually exclusive: SwapSettled after SwapCancelled is
 
   expect(notifier.notifications).toHaveLength(1);
   expect(notifier.notifications[0].outcome).toBe('cancelled');
+});
+
+// ── Part 4: loan operation ───────────────────────────────────────────────
+
+test('loan repaid before dueBlock -> repaid notification', async () => {
+  const dual = new CapturingDualNotifier();
+  const node = new SimulatedNode([
+    block(1, [loanRequested('L1', /* dueBlock */ 5)]),
+    block(2, []),
+    block(3, [loanRepaid('L1')]),
+    block(4, []),
+    block(5, []),
+  ]);
+
+  await new VaultSwapScanner(node, dual).start();
+
+  expect(dual.loans).toHaveLength(1);
+  expect(dual.loans[0].outcome).toBe('repaid');
+  expect(dual.loans[0].repaid?.blockNumber).toBe(3);
+});
+
+test('loan repaid AT dueBlock still counts as repaid', async () => {
+  // Boundary test from README: "repay arriving up to and including dueBlock counts".
+  const dual = new CapturingDualNotifier();
+  const node = new SimulatedNode([
+    block(1, [loanRequested('L1', /* dueBlock */ 3)]),
+    block(2, []),
+    block(3, [loanRepaid('L1')]),
+  ]);
+
+  await new VaultSwapScanner(node, dual).start();
+
+  expect(dual.loans).toHaveLength(1);
+  expect(dual.loans[0].outcome).toBe('repaid');
+});
+
+test('loan defaulted when dueBlock passes with no repayment', async () => {
+  // README: "default fires only after dueBlock passes without repay".
+  // dueBlock=3; default must fire once block 4 is processed.
+  const dual = new CapturingDualNotifier();
+  const node = new SimulatedNode([
+    block(1, [loanRequested('L1', /* dueBlock */ 3)]),
+    block(2, []),
+    block(3, []),
+    block(4, []),
+  ]);
+
+  await new VaultSwapScanner(node, dual).start();
+
+  expect(dual.loans).toHaveLength(1);
+  expect(dual.loans[0].outcome).toBe('defaulted');
+  expect(dual.loans[0].repaid).toBeUndefined();
+});
+
+test('default does NOT fire while block <= dueBlock is the head', async () => {
+  // Chain stops AT dueBlock; the grace period is still open.
+  const dual = new CapturingDualNotifier();
+  const node = new SimulatedNode([
+    block(1, [loanRequested('L1', /* dueBlock */ 3)]),
+    block(2, []),
+    block(3, []),
+  ]);
+
+  await new VaultSwapScanner(node, dual).start();
+
+  expect(dual.loans).toHaveLength(0);
+});
+
+test('late LoanRepaid (after dueBlock) is dropped; default already fired', async () => {
+  const dual = new CapturingDualNotifier();
+  const node = new SimulatedNode([
+    block(1, [loanRequested('L1', /* dueBlock */ 2)]),
+    block(2, []),
+    block(3, [loanRepaid('L1')]), // arrives after dueBlock passed
+  ]);
+
+  await new VaultSwapScanner(node, dual).start();
+
+  // Block 3 processes: default detection runs FIRST after the swap pass
+  // and the loan pass. Order in our implementation: swap-logs, loan-logs,
+  // detectLoanDefaults. So at block 3 the loanRepaid runs first (and is
+  // rejected because blockNumber > dueBlock), then detectLoanDefaults
+  // emits 'defaulted'.
+  expect(dual.loans).toHaveLength(1);
+  expect(dual.loans[0].outcome).toBe('defaulted');
+});
+
+test('swap and loan in the same scanner run remain independent', async () => {
+  const dual = new CapturingDualNotifier();
+  const node = new SimulatedNode([
+    block(1, [requested('S1'), loanRequested('L1', 10)]),
+    block(2, [locked('S1')]),
+    block(3, [settledLog('S1', 'filled'), loanRepaid('L1')]),
+  ]);
+
+  await new VaultSwapScanner(node, dual).start();
+
+  expect(dual.swaps).toHaveLength(1);
+  expect(dual.swaps[0].outcome).toBe('filled');
+  expect(dual.loans).toHaveLength(1);
+  expect(dual.loans[0].outcome).toBe('repaid');
+});
+
+test('orphan LoanRepaid (no prior LoanRequested) is dropped with a warning', async () => {
+  const dual = new CapturingDualNotifier();
+  const warnSpy = jest.spyOn(console, 'warn');
+  const node = new SimulatedNode([block(1, [loanRepaid('L1')])]);
+
+  await new VaultSwapScanner(node, dual).start();
+
+  expect(dual.loans).toHaveLength(0);
+  expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('orphan LoanRepaid'));
 });

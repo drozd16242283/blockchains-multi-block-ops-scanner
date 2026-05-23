@@ -1,4 +1,4 @@
-import { FundsLockedEvent, SwapNotification, SwapRequestedEvent } from './types';
+import { FundsLockedEvent, LoanNotification, LoanRequestedEvent, SwapNotification, SwapRequestedEvent } from './types';
 
 /** Three independent state spaces:
  	*   - cursor              : last fully-processed block
@@ -13,10 +13,18 @@ export interface PendingSwap {
   fundsLocked?: FundsLockedEvent;
 }
 
-export interface IStateStore {
+// Scanner-level cursor concern, split out in Part 4 so the operation-
+// agnostic Scanner doesn't depend on the swap-specific store interface.
+export interface ICursorStore {
   getCursor(): Promise<number | undefined>;
   setCursor(blockNumber: number): Promise<void>;
+}
 
+export interface PendingLoan {
+  requested: LoanRequestedEvent;
+}
+
+export interface IStateStore extends ICursorStore {
   setRequested(swapId: string, ev: SwapRequestedEvent): Promise<void>;
   setFundsLocked(swapId: string, ev: FundsLockedEvent): Promise<void>;
   getPending(swapId: string): Promise<PendingSwap | undefined>;
@@ -33,6 +41,18 @@ export interface IStateStore {
 
   getPendingDeliveries(): Promise<SwapNotification[]>;
   markDelivered(swapId: string): Promise<void>;
+
+  // ── Loan-side (Part 4): separate ID space; loan and swap IDs may collide.
+  setLoanRequested(loanId: string, ev: LoanRequestedEvent): Promise<void>;
+  getPendingLoan(loanId: string): Promise<PendingLoan | undefined>;
+  // Strictly < blockNumber: repay arriving AT dueBlock still counts.
+  getLoansDueBefore(blockNumber: number): Promise<PendingLoan[]>;
+
+  recordLoanTerminal(loanId: string, notification: LoanNotification): Promise<void>;
+  hasLoanEmitted(loanId: string): Promise<boolean>;
+
+  getPendingLoanDeliveries(): Promise<LoanNotification[]>;
+  markLoanDelivered(loanId: string): Promise<void>;
 }
 
 export class InMemoryStateStore implements IStateStore {
@@ -40,6 +60,10 @@ export class InMemoryStateStore implements IStateStore {
   private pending = new Map<string, PendingSwap>();
   private emitted = new Set<string>();
   private outbox = new Map<string, SwapNotification>();
+
+  private loanPending = new Map<string, PendingLoan>();
+  private loanEmitted = new Set<string>();
+  private loanOutbox = new Map<string, LoanNotification>();
 
   async getCursor(): Promise<number | undefined> {
     return this.cursor;
@@ -80,5 +104,41 @@ export class InMemoryStateStore implements IStateStore {
 
   async markDelivered(swapId: string): Promise<void> {
     this.outbox.delete(swapId);
+  }
+
+  // ── Loan-side ─────────────────────────────────────────────────────────
+
+  async setLoanRequested(loanId: string, ev: LoanRequestedEvent): Promise<void> {
+    this.loanPending.set(loanId, { requested: ev });
+  }
+
+  async getPendingLoan(loanId: string): Promise<PendingLoan | undefined> {
+    return this.loanPending.get(loanId);
+  }
+
+  async getLoansDueBefore(blockNumber: number): Promise<PendingLoan[]> {
+    const out: PendingLoan[] = [];
+    for (const loan of this.loanPending.values()) {
+      if (loan.requested.dueBlock < blockNumber) out.push(loan);
+    }
+    return out;
+  }
+
+  async recordLoanTerminal(loanId: string, notification: LoanNotification): Promise<void> {
+    this.loanEmitted.add(loanId);
+    this.loanOutbox.set(loanId, notification);
+    this.loanPending.delete(loanId);
+  }
+
+  async hasLoanEmitted(loanId: string): Promise<boolean> {
+    return this.loanEmitted.has(loanId);
+  }
+
+  async getPendingLoanDeliveries(): Promise<LoanNotification[]> {
+    return Array.from(this.loanOutbox.values());
+  }
+
+  async markLoanDelivered(loanId: string): Promise<void> {
+    this.loanOutbox.delete(loanId);
   }
 }

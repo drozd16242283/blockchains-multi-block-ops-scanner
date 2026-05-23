@@ -95,8 +95,45 @@ export interface IBlockchainNode {
   getBlock(blockNumber: number): Promise<Block>;
 }
 
+// ── Loan protocol events (Part 4) ─────────────────────────────────────────────
+
+export interface LoanRequestedEvent {
+  type: 'LoanRequested';
+  loanId: string;
+  borrower: string;
+  amount: string;
+  dueBlock: number;
+  blockNumber: number;
+  txHash: string;
+}
+
+export interface LoanRepaidEvent {
+  type: 'LoanRepaid';
+  loanId: string;
+  borrower: string;
+  amountRepaid: string;
+  blockNumber: number;
+  txHash: string;
+}
+
+export type LoanOutcome = 'repaid' | 'defaulted';
+
+// `repaid` notifications carry the LoanRepaid event; `defaulted`
+// notifications are scanner-emitted at `dueBlock` so the repaid slot is
+// absent. This is *safe* time-based detection: `dueBlock` is part of the
+// LoanRequested payload itself — the chain defines the timeout, not us.
+export interface LoanNotification {
+  loanId: string;
+  outcome: LoanOutcome;
+  requested: LoanRequestedEvent;
+  repaid?: LoanRepaidEvent;
+}
+
 // ── Notifier interface ────────────────────────────────────────────────────────
 
-export interface INotifier {
-  notify(notification: SwapNotification): Promise<void>;
+// Generic so the same shape is reused for swaps, loans, and any future
+// operation. The default keeps Part-1..3 call sites (`INotifier` without a
+// type arg) compiling unchanged.
+export interface INotifier<T = SwapNotification> {
+  notify(notification: T): Promise<void>;
 }
