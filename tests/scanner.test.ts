@@ -74,6 +74,18 @@ const settledLog = (swapId: string, status: 'filled' | 'expired' = 'filled'): Ra
   args: { txHash: `0xtx_${swapId}_set`, swapId, amountOut: '9950000', status },
 });
 
+const lockFailed = (swapId: string, reason = 'insufficient_liquidity'): RawLog => ({
+  address: VAULT,
+  event: 'FundsLockFailed',
+  args: { txHash: `0xtx_${swapId}_lockfail`, swapId, vault: '0xVault1', reason },
+});
+
+const cancelled = (swapId: string, by = '0xAlice', reason = 'user_abort'): RawLog => ({
+  address: VAULT,
+  event: 'SwapCancelled',
+  args: { txHash: `0xtx_${swapId}_cancel`, swapId, by, reason },
+});
+
 const fastRetry = { maxAttempts: 4, baseDelayMs: 1, maxDelayMs: 5 };
 const fastNotifyRetry = { maxAttempts: 4, baseDelayMs: 1, maxDelayMs: 5 };
 
@@ -103,8 +115,8 @@ test('happy path: three events across three blocks → one filled notification, 
   expect(n.swapId).toBe('s1');
   expect(n.outcome).toBe('filled');
   expect(n.requested.blockNumber).toBe(1);
-  expect(n.fundsLocked.blockNumber).toBe(2);
-  expect(n.settled.blockNumber).toBe(3);
+  expect(n.fundsLocked?.blockNumber).toBe(2);
+  expect(n.settled?.blockNumber).toBe(3);
   expect(await state.getPendingDeliveries()).toHaveLength(0);
   expect(await state.getPending('s1')).toBeUndefined();
   expect(await state.getCursor()).toBe(3);
@@ -328,4 +340,95 @@ test('permanent notifier failure: swap is terminal in state, outbox holds the no
   }
   expect(recovered.notifications).toHaveLength(1);
   expect(await state.getPendingDeliveries()).toHaveLength(0);
+});
+
+// ── Part 3: hardened protocol ────────────────────────────────────────────
+
+test('FundsLockFailed after Requested -> lock_failed notification, no settle expected', async () => {
+  const notifier = new CapturingNotifier();
+  const node = new SimulatedNode([
+    block(1, [requested('s1')]),
+    block(2, [lockFailed('s1', 'insufficient_liquidity')]),
+  ]);
+
+  await new VaultSwapScanner(node, notifier).start();
+
+  expect(notifier.notifications).toHaveLength(1);
+  const n = notifier.notifications[0];
+  expect(n.outcome).toBe('lock_failed');
+  expect(n.lockFailed?.reason).toBe('insufficient_liquidity');
+  expect(n.fundsLocked).toBeUndefined();
+  expect(n.settled).toBeUndefined();
+});
+
+test('SwapCancelled before Locked -> cancelled notification with no fundsLocked', async () => {
+  const notifier = new CapturingNotifier();
+  const node = new SimulatedNode([
+    block(1, [requested('s1')]),
+    block(2, [cancelled('s1', '0xAlice', 'user_abort')]),
+  ]);
+
+  await new VaultSwapScanner(node, notifier).start();
+
+  expect(notifier.notifications).toHaveLength(1);
+  const n = notifier.notifications[0];
+  expect(n.outcome).toBe('cancelled');
+  expect(n.cancelled?.by).toBe('0xAlice');
+  expect(n.fundsLocked).toBeUndefined();
+});
+
+test('SwapCancelled after Locked -> cancelled notification carries the prior fundsLocked', async () => {
+  const notifier = new CapturingNotifier();
+  const node = new SimulatedNode([
+    block(1, [requested('s1')]),
+    block(2, [locked('s1')]),
+    block(3, [cancelled('s1', '0xProtocol', 'price_drift')]),
+  ]);
+
+  await new VaultSwapScanner(node, notifier).start();
+
+  expect(notifier.notifications).toHaveLength(1);
+  const n = notifier.notifications[0];
+  expect(n.outcome).toBe('cancelled');
+  expect(n.fundsLocked).toBeDefined();
+  expect(n.cancelled?.by).toBe('0xProtocol');
+});
+
+test('orphan FundsLockFailed (no prior Requested) is dropped with a warning', async () => {
+  const notifier = new CapturingNotifier();
+  const warnSpy = jest.spyOn(console, 'warn');
+  const node = new SimulatedNode([block(1, [lockFailed('s1')])]);
+
+  await new VaultSwapScanner(node, notifier).start();
+
+  expect(notifier.notifications).toHaveLength(0);
+  expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('orphan FundsLockFailed'));
+});
+
+test('orphan SwapCancelled (no prior Requested) is dropped with a warning', async () => {
+  const notifier = new CapturingNotifier();
+  const warnSpy = jest.spyOn(console, 'warn');
+  const node = new SimulatedNode([block(1, [cancelled('s1')])]);
+
+  await new VaultSwapScanner(node, notifier).start();
+
+  expect(notifier.notifications).toHaveLength(0);
+  expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('orphan SwapCancelled'));
+});
+
+test('terminal events are mutually exclusive: SwapSettled after SwapCancelled is dropped', async () => {
+  // SwapCancelled is terminal; any later event for the same swap (including
+  // a stray SwapSettled from a misbehaving chain) must be ignored.
+  const notifier = new CapturingNotifier();
+  const node = new SimulatedNode([
+    block(1, [requested('s1')]),
+    block(2, [locked('s1')]),
+    block(3, [cancelled('s1')]),
+    block(4, [settledLog('s1', 'filled')]),
+  ]);
+
+  await new VaultSwapScanner(node, notifier).start();
+
+  expect(notifier.notifications).toHaveLength(1);
+  expect(notifier.notifications[0].outcome).toBe('cancelled');
 });

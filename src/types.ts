@@ -44,18 +44,48 @@ export interface SwapSettledEvent {
   txHash: string;
 }
 
-export type SwapEvent = SwapRequestedEvent | FundsLockedEvent | SwapSettledEvent;
+// Added in Part 3: terminal events for failure paths the original
+// protocol left unspecified. See PROTOCOL.md.
+export interface FundsLockFailedEvent {
+  type: 'FundsLockFailed';
+  swapId: string;
+  vault: string;
+  reason: string;
+  blockNumber: number;
+  txHash: string;
+}
+
+export interface SwapCancelledEvent {
+  type: 'SwapCancelled';
+  swapId: string;
+  by: string;     // who initiated the cancel (user / protocol / vault)
+  reason: string;
+  blockNumber: number;
+  txHash: string;
+}
+
+export type SwapEvent =
+  | SwapRequestedEvent
+  | FundsLockedEvent
+  | SwapSettledEvent
+  | FundsLockFailedEvent
+  | SwapCancelledEvent;
 
 // ── Notification ──────────────────────────────────────────────────────────────
 
-export type SwapOutcome = 'filled' | 'expired';
+export type SwapOutcome = 'filled' | 'expired' | 'lock_failed' | 'cancelled';
 
+// `requested` is always present (no notification without a request).
+// All other event slots are populated only when seen on-chain; `outcome`
+// is the single source of truth for which terminal state the swap reached.
 export interface SwapNotification {
   swapId: string;
   outcome: SwapOutcome;
   requested: SwapRequestedEvent;
-  fundsLocked: FundsLockedEvent;
-  settled: SwapSettledEvent;
+  fundsLocked?: FundsLockedEvent;
+  lockFailed?: FundsLockFailedEvent;
+  cancelled?: SwapCancelledEvent;
+  settled?: SwapSettledEvent;
 }
 
 // ── Node interface ────────────────────────────────────────────────────────────

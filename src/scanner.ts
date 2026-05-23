@@ -1,10 +1,13 @@
 import {
   Block,
+  FundsLockFailedEvent,
   FundsLockedEvent,
   IBlockchainNode,
   INotifier,
   RawLog,
+  SwapCancelledEvent,
   SwapNotification,
+  SwapOutcome,
   SwapRequestedEvent,
   SwapSettledEvent,
 } from './types';
@@ -22,7 +25,14 @@ const DEFAULT_NOTIFY_RETRY: RetryConfig = {
   maxDelayMs: 2_000,
 };
 
-type ParsedSwapEvent = SwapRequestedEvent | FundsLockedEvent | SwapSettledEvent;
+type ParsedSwapEvent =
+  | SwapRequestedEvent
+  | FundsLockedEvent
+  | SwapSettledEvent
+  | FundsLockFailedEvent
+  | SwapCancelledEvent;
+
+type TerminalEvent = SwapSettledEvent | FundsLockFailedEvent | SwapCancelledEvent;
 
 function parseLog(log: RawLog, blockNumber: number): ParsedSwapEvent | null {
   if (log.address !== VAULT_SWAP_CONTRACT) return null;
@@ -59,6 +69,24 @@ function parseLog(log: RawLog, blockNumber: number): ParsedSwapEvent | null {
         blockNumber,
         txHash,
       };
+    case 'FundsLockFailed':
+      return {
+        type: 'FundsLockFailed',
+        swapId: String(log.args['swapId']),
+        vault: String(log.args['vault']),
+        reason: String(log.args['reason'] ?? ''),
+        blockNumber,
+        txHash,
+      };
+    case 'SwapCancelled':
+      return {
+        type: 'SwapCancelled',
+        swapId: String(log.args['swapId']),
+        by: String(log.args['by'] ?? ''),
+        reason: String(log.args['reason'] ?? ''),
+        blockNumber,
+        txHash,
+      };
     default:
       return null;
   }
@@ -84,8 +112,13 @@ export interface VaultSwapScannerOptions {
  * Scanner: walks the chain, correlates VaultSwap events by swapId,
  * emits one notification per swap on terminal state.
  *
+ * Terminal states (see PROTOCOL.md for the full matrix):
+ *   - SwapSettled       -> outcome 'filled' or 'expired'
+ *   - FundsLockFailed   -> outcome 'lock_failed'
+ *   - SwapCancelled     -> outcome 'cancelled'
+ *
  * Delivery model — transactional outbox:
- *   1. On SwapSettled, the scanner atomically marks the swap emitted,
+ *   1. On any terminal event, the scanner atomically marks the swap emitted,
  *      enqueues its notification in the outbox, and clears pending state
  *      After it, the scanner has durably accepted responsibility for delivering the notification.
  *   2. Inline delivery is attempted for current swap.
@@ -96,7 +129,7 @@ export interface VaultSwapScannerOptions {
  *      staleness with its own retry/backoff and concurrency control.
  *
  * Restart safety: hasEmitted(swapId) is the source of truth for "already-terminal."
- * A restart that re-reads a Settled event sees hasEmitted=true and drops it.
+ * A restart that re-reads any terminal event sees hasEmitted=true and drops it.
  * No double-emit at this layer. Downstream consumers close it by being idempotent on swapId.
  */
 export class VaultSwapScanner {
@@ -209,17 +242,18 @@ export class VaultSwapScanner {
         await this.state.setFundsLocked(ev.swapId, ev);
         return;
       case 'SwapSettled':
-        await this.finalizeSwap(ev);
+      case 'FundsLockFailed':
+      case 'SwapCancelled':
+        await this.finalize(ev);
         return;
     }
   }
 
   /**
-   * Terminal-state handler. Order is deliberate:
+   * Terminal-state handler.
    *
-   *   1. Build notification from accumulated pending state.
+   *   1. Build notification from accumulated pending state + this terminal event.
    *   2. recordTerminal - atomic commit (markEmitted + enqueue outbox + clearPending).
-	 *   After this, restart safety holds: a re-read of the Settled event will see hasEmitted=true and drop.
    *   3. Inline notify for current swap, with retry.
    *   4. On success -> markDelivered (remove from outbox).
    *      On failure -> log; entry stays in outbox; background drainer job (worker) picks it up later.
@@ -228,30 +262,51 @@ export class VaultSwapScanner {
    * catch halts the run, the cursor doesn't advance, the block is
    * re-processed on next invocation, and hasEmitted keeps us idempotent.
    */
-  private async finalizeSwap(ev: SwapSettledEvent): Promise<void> {
+  private async finalize(ev: TerminalEvent): Promise<void> {
     const pending: PendingSwap = (await this.state.getPending(ev.swapId)) ?? {};
-    const missing: string[] = [];
-    if (!pending.requested) missing.push('SwapRequested');
-    if (!pending.fundsLocked) missing.push('FundsLocked');
 
-    if (missing.length > 0) {
-      // Orphan settle: we never saw the predecessors.
-			// Most common cause is a scanner that started mid-stream.
-			// Refuse to fabricate a notification from partial data.
+    // Every notification requires the originating SwapRequested.
+    // Without it we'd be fabricating a swap from partial data — the most
+    // common cause is a scanner that started mid-stream.
+    if (!pending.requested) {
       console.warn(
-        `[scanner] orphan SwapSettled ignored swapId=${ev.swapId} blockNumber=${ev.blockNumber} missing=${missing.join(
-          ',',
-        )}`,
+        `[scanner] orphan ${ev.type} ignored swapId=${ev.swapId} blockNumber=${ev.blockNumber}: no SwapRequested in our view`,
       );
       return;
     }
 
+    let outcome: SwapOutcome;
+    let extra: Partial<SwapNotification>;
+
+    switch (ev.type) {
+      case 'SwapSettled':
+        // Settled implies a successful lock per protocol; refuse to emit
+        // a settle that contradicts our pending state.
+        if (!pending.fundsLocked) {
+          console.warn(
+            `[scanner] orphan SwapSettled ignored swapId=${ev.swapId} blockNumber=${ev.blockNumber}: no FundsLocked in our view`,
+          );
+          return;
+        }
+        outcome = ev.status;
+        extra = { settled: ev };
+        break;
+      case 'FundsLockFailed':
+        outcome = 'lock_failed';
+        extra = { lockFailed: ev };
+        break;
+      case 'SwapCancelled':
+        outcome = 'cancelled';
+        extra = { cancelled: ev };
+        break;
+    }
+
     const notification: SwapNotification = {
       swapId: ev.swapId,
-      outcome: ev.status,
-      requested: pending.requested!,
-      fundsLocked: pending.fundsLocked!,
-      settled: ev,
+      outcome,
+      requested: pending.requested,
+      fundsLocked: pending.fundsLocked,
+      ...extra,
     };
 
     // Commit point
